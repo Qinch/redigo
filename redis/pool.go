@@ -144,11 +144,13 @@ type Pool struct {
 
 	// Maximum number of connections allocated by the pool at a given time.
 	// When zero, there is no limit on the number of connections in the pool.
+	// MaxActive=used+idle
 	MaxActive int
 
 	// Close connections after remaining idle for this duration. If the value
 	// is zero, then idle connections are not closed. Applications should set
 	// the timeout to a value less than the server's timeout.
+	// now-t(即上次conn close归还pool的时间)>IdleTimeout则关闭
 	IdleTimeout time.Duration
 
 	// If Wait is true and the pool is at the MaxActive limit, then Get() waits
@@ -157,14 +159,15 @@ type Pool struct {
 
 	// Close connections older than this duration. If the value is zero, then
 	// the pool does not close connections based on age.
+	// now-creat>MaxConnLifetime则关闭
 	MaxConnLifetime time.Duration
 
 	mu           sync.Mutex    // mu protects the following fields
 	closed       bool          // set to true when the pool is closed.
-	active       int           // the number of open connections in the pool
-	initOnce     sync.Once     // the init ch once func
-	ch           chan struct{} // limits open connections when p.Wait is true
-	idle         idleList      // idle connections
+	active       int           // the number of open connections in the pool（创建的所有链接used+idle）
+	initOnce     sync.Once     // the init ch once func(初始化channel ch)
+	ch           chan struct{} // limits open connections when p.Wait is true（消费一个conn, 则读取一次channel）
+	idle         idleList      // idle connections(idle链接:双向非循环链表)
 	waitCount    int64         // total number of connections waited for.
 	waitDuration time.Duration // total time waited for new connections.
 }
@@ -204,14 +207,17 @@ func (p *Pool) GetContext(ctx context.Context) (Conn, error) {
 
 	p.mu.Lock()
 
+	// 如果wait, 则更新统计数据
 	if waited > 0 {
-		p.waitCount++
+		p.waitCount++ // wait numbers
 		p.waitDuration += waited
 	}
 
 	// Prune stale connections at the back of the idle list.
 	if p.IdleTimeout > 0 {
 		n := p.idle.count
+		// 遍历idle 双向非循环list（只要子list中的conn，都是close归还的，所以t一定存在），
+		// 判断是否空闲超时:p.idle.back.t.Add(p.IdleTimeout).Before(nowFunc())
 		for i := 0; i < n && p.idle.back != nil && p.idle.back.t.Add(p.IdleTimeout).Before(nowFunc()); i++ {
 			pc := p.idle.back
 			p.idle.popBack()
@@ -249,12 +255,14 @@ func (p *Pool) GetContext(ctx context.Context) (Conn, error) {
 		return errorConn{ErrPoolExhausted}, ErrPoolExhausted
 	}
 
+	// 如果idle list为空/idle conn不可用，则创建一个新的conn
 	p.active++
 	p.mu.Unlock()
 	c, err := p.dial(ctx)
 	if err != nil {
 		p.mu.Lock()
 		p.active--
+		// p.ch!=nil means Wait is true.
 		if p.ch != nil && !p.closed {
 			p.ch <- struct{}{}
 		}
@@ -363,14 +371,14 @@ func (p *Pool) waitVacantConn(ctx context.Context) (waited time.Duration, err er
 
 	// wait indicates if we believe it will block so its not 100% accurate
 	// however for stats it should be good enough.
-	wait := len(p.ch) == 0
+	wait := len(p.ch) == 0 // 如果channel缓冲中没有数据， 则表示没有idle conn
 	var start time.Time
 	if wait {
 		start = time.Now()
 	}
 
 	select {
-	case <-p.ch:
+	case <-p.ch: // 存在idele conn
 		// Additionally check that context hasn't expired while we were waiting,
 		// because `select` picks a random `case` if several of them are "ready".
 		select {
@@ -399,6 +407,7 @@ func (p *Pool) dial(ctx context.Context) (Conn, error) {
 	return nil, errors.New("redigo: must pass Dial or DialContext to pool")
 }
 
+// 将close conn归还pool,如果forceClose则强制将conn关闭
 func (p *Pool) put(pc *poolConn, forceClose bool) error {
 	p.mu.Lock()
 	if !p.closed && !forceClose {
@@ -588,14 +597,19 @@ func (ec errorConn) Receive() (interface{}, error)                         { ret
 func (ec errorConn) ReceiveWithTimeout(time.Duration) (interface{}, error) { return nil, ec.err }
 
 type idleList struct {
+	// 链表中节点数量
 	count       int
+	// 分别指向双向非循环链表的头/尾节点
 	front, back *poolConn
 }
 
 type poolConn struct {
 	c          Conn
+	// t is the time that the connection was returned to the pool
 	t          time.Time
+	// conn创建时间
 	created    time.Time
+	// 节点的双向指针
 	next, prev *poolConn
 }
 
@@ -611,6 +625,7 @@ func (l *idleList) pushFront(pc *poolConn) {
 	l.count++
 }
 
+// pop首节点
 func (l *idleList) popFront() {
 	pc := l.front
 	l.count--
@@ -623,6 +638,7 @@ func (l *idleList) popFront() {
 	pc.next, pc.prev = nil, nil
 }
 
+// pop尾节点
 func (l *idleList) popBack() {
 	pc := l.back
 	l.count--
